@@ -48,7 +48,7 @@ struct MemflowOsShard {
     required: ExposedTypes,
 
     // Parameters
-    #[shard_param("Connector", "The name of the memflow connector to use.", [common_type::string])]
+    #[shard_param("Connector", "The name of the memflow connector to use.", [common_type::none, common_type::string])]
     connector_name: ClonedVar,
     #[shard_param("Os", "The name of the OS plugin to use (e.g., 'win32', 'linux').", [common_type::string])]
     os_name: ClonedVar,
@@ -59,11 +59,10 @@ struct MemflowOsShard {
 
 impl Default for MemflowOsShard {
     fn default() -> Self {
-        let default_connector_name = Var::ephemeral_string("kvm");
-        let default_os_name = Var::ephemeral_string("win32");
+        let default_os_name = Var::ephemeral_string("native");
         Self {
             required: ExposedTypes::new(),
-            connector_name: default_connector_name.into(),
+            connector_name: ClonedVar::default(),
             os_name: default_os_name.into(),
             output_os: ClonedVar::default(),
         }
@@ -105,7 +104,7 @@ impl Shard for MemflowOsShard {
         _input: &Var,
     ) -> std::result::Result<Option<Var>, &str> {
         // Retrieve parameters
-        let connector_name: &str = self.connector_name.0.as_ref().try_into()?;
+        let connector_name: &str = self.connector_name.0.as_ref().try_into().unwrap_or("");
         let os_name: &str = self.os_name.0.as_ref().try_into()?;
 
         shlog_debug!(
@@ -116,16 +115,28 @@ impl Shard for MemflowOsShard {
 
         // Create inventory and OS instance
         let inventory = Inventory::scan();
-        let os = inventory
-            .builder()
-            .connector(connector_name)
-            .os(os_name)
-            .build()
-            .map_err(|e| {
+
+        if connector_name != "" {
+            let os = inventory
+                .builder()
+                .connector(connector_name)
+                .os(os_name)
+                .build()
+                .map_err(|e| {
+                    shlog_error!("Failed to create OS instance: {}", e);
+                    "Failed to create OS instance."
+                })?;
+
+            self.output_os = Var::new_ref_counted(MemflowOsWrapper(os), &MEMFLOW_OS_TYPE).into();
+        } else {
+            let os = inventory.builder().os(os_name).build().map_err(|e| {
                 shlog_error!("Failed to create OS instance: {}", e);
                 "Failed to create OS instance."
             })?;
-        self.output_os = Var::new_ref_counted(MemflowOsWrapper(os), &MEMFLOW_OS_TYPE).into();
+
+            self.output_os = Var::new_ref_counted(MemflowOsWrapper(os), &MEMFLOW_OS_TYPE).into();
+        }
+
         Ok(Some(self.output_os.0))
     }
 }
