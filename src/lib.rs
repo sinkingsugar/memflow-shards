@@ -27,19 +27,37 @@ lazy_static! {
     // Unique Vendor and Type IDs for the Inventory object
     static ref MEMFLOW_VENDOR_ID: i32 = fourCharacterCode(*b"MEMF"); // Example Vendor ID
     static ref MEMFLOW_OS_TYPE_ID: i32 = fourCharacterCode(*b"OS__"); // Example Type ID
+    static ref MEMFLOW_PROCESS_TYPE_ID: i32 = fourCharacterCode(*b"PROC"); // Process Type ID
     // The Shards Type descriptor for the Inventory object
     pub static ref MEMFLOW_OS_TYPE: Type = Type::object(*MEMFLOW_VENDOR_ID, *MEMFLOW_OS_TYPE_ID);
     pub static ref MEMFLOW_OS_TYPE_VAR: Type = Type::context_variable(&[*MEMFLOW_OS_TYPE]);
     // A vector containing the type, useful for input/output_types
     pub static ref MEMFLOW_OS_TYPES: Vec<Type> = vec![*MEMFLOW_OS_TYPE];
+
+    // Process type definitions
+    pub static ref MEMFLOW_PROCESS_TYPE: Type = Type::object(*MEMFLOW_VENDOR_ID, *MEMFLOW_PROCESS_TYPE_ID);
+    pub static ref MEMFLOW_PROCESS_TYPE_VAR: Type = Type::context_variable(&[*MEMFLOW_PROCESS_TYPE]);
+    pub static ref MEMFLOW_PROCESS_TYPES: Vec<Type> = vec![*MEMFLOW_PROCESS_TYPE];
 }
 
-// Wrapper struct to hold the OsInstanceArcBox
-#[derive(Clone)] // Clone is needed because OsInstanceArcBox is Clone
-pub struct MemflowOsWrapper(pub OsInstanceArcBox<'static>);
+mod memflow_os_wrapper {
+    use super::*;
 
-// 3. Implement Shards object handling for the wrapper
-ref_counted_object_type_impl!(MemflowOsWrapper);
+    // Wrapper struct to hold the OsInstanceArcBox
+    #[derive(Clone)] // Clone is needed because OsInstanceArcBox is Clone
+    pub struct MemflowOsWrapper(pub OsInstanceArcBox<'static>);
+
+    ref_counted_object_type_impl!(MemflowOsWrapper);
+}
+
+mod memflow_process_wrapper {
+    use super::*;
+
+    // Process wrapper struct to hold the ProcessInstance
+    pub struct MemflowProcessWrapper(pub ProcessInstanceArcBox<'static>);
+
+    ref_counted_object_type_impl!(MemflowProcessWrapper);
+}
 
 // 4. Define the Shard struct
 #[derive(shards::shard)]
@@ -84,8 +102,8 @@ impl Shard for MemflowOsShard {
         &MEMFLOW_OS_TYPES // Outputs our custom OS object
     }
 
-    fn compose(&mut self, _data: &InstanceData) -> std::result::Result<Type, &str> {
-        // No specific composition logic needed here yet, just return output type
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
         Ok(self.output_types()[0])
     }
 
@@ -131,14 +149,18 @@ impl Shard for MemflowOsShard {
                     "Failed to create OS instance."
                 })?;
 
-            self.output_os = Var::new_ref_counted(MemflowOsWrapper(os), &MEMFLOW_OS_TYPE).into();
+            self.output_os =
+                Var::new_ref_counted(memflow_os_wrapper::MemflowOsWrapper(os), &MEMFLOW_OS_TYPE)
+                    .into();
         } else {
             let os = inventory.builder().os(os_name).build().map_err(|e| {
                 shlog_error!("Failed to create OS instance: {}", e);
                 "Failed to create OS instance."
             })?;
 
-            self.output_os = Var::new_ref_counted(MemflowOsWrapper(os), &MEMFLOW_OS_TYPE).into();
+            self.output_os =
+                Var::new_ref_counted(memflow_os_wrapper::MemflowOsWrapper(os), &MEMFLOW_OS_TYPE)
+                    .into();
         }
 
         Ok(Some(self.output_os.0))
@@ -183,7 +205,8 @@ impl Shard for MemflowProcessListShard {
         &ANY_TABLE_TYPES // Outputs sequence of process data tables
     }
 
-    fn compose(&mut self, _data: &InstanceData) -> std::result::Result<Type, &str> {
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
         Ok(self.output_types()[0])
     }
 
@@ -207,7 +230,10 @@ impl Shard for MemflowProcessListShard {
         let os_var = &self.os_instance.get();
 
         let os = unsafe {
-            &mut *Var::from_ref_counted_object::<MemflowOsWrapper>(os_var, &*MEMFLOW_OS_TYPE)?
+            &mut *Var::from_ref_counted_object::<memflow_os_wrapper::MemflowOsWrapper>(
+                os_var,
+                &*MEMFLOW_OS_TYPE,
+            )?
         };
 
         shlog_debug!("Getting process list from OS instance");
@@ -240,12 +266,127 @@ impl Shard for MemflowProcessListShard {
     }
 }
 
+// Define the Process Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.Process",
+    "Creates a handle to a specific process from a Memflow OS instance."
+)]
+struct MemflowProcessShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("Os", "The Memflow OS instance to get the process from.", [*MEMFLOW_OS_TYPE, *MEMFLOW_OS_TYPE_VAR])]
+    os_instance: ParamVar,
+
+    #[shard_param("Name", "Process name to search for (optional).", [common_type::none, common_type::string, common_type::string_var])]
+    process_name: ParamVar,
+
+    #[shard_param("Pid", "Process ID to search for (optional).", [common_type::none, common_type::int, common_type::int_var])]
+    process_pid: ParamVar,
+
+    // Store the output Process object
+    output_process: ClonedVar,
+}
+
+impl Default for MemflowProcessShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            os_instance: ParamVar::new_named("memflow/default-os"),
+            process_name: ParamVar::default(),
+            process_pid: ParamVar::default(),
+            output_process: ClonedVar::default(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowProcessShard {
+    fn input_types(&mut self) -> &Types {
+        &NONE_TYPES // Takes no input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Outputs our custom Process object
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        // Drop the Process instance when the shard is cleaned up
+        self.output_process = ClonedVar::default();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        _input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the OS instance from parameter
+        let os_var = &self.os_instance.get();
+        let os = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_os_wrapper::MemflowOsWrapper>(
+                os_var,
+                &*MEMFLOW_OS_TYPE,
+            )?
+        };
+
+        // Try to find the process by name or pid
+        let process_instance = if !self.process_name.get().is_none() {
+            // Find by name
+            let name: &str = self.process_name.get().as_ref().try_into()?;
+            shlog_debug!("Searching for process by name: {}", name);
+
+            os.0.process_by_name(name).map_err(|e| {
+                shlog_error!("Failed to find process by name '{}': {}", name, e);
+                "Process not found by name."
+            })?
+        } else if !self.process_pid.get().is_none() {
+            // Find by PID
+            let pid: i64 = self.process_pid.get().as_ref().try_into()?;
+            let pid_u32 = pid as u32;
+            shlog_debug!("Searching for process by PID: {}", pid_u32);
+
+            os.0.process_by_pid(pid_u32).map_err(|e| {
+                shlog_error!("Failed to find process by PID {}: {}", pid_u32, e);
+                "Process not found by PID."
+            })?
+        } else {
+            return Err("Either Name or Pid parameter must be provided.");
+        };
+
+        // Create and return the process object
+        self.output_process = Var::new_ref_counted(
+            memflow_process_wrapper::MemflowProcessWrapper(process_instance),
+            &MEMFLOW_PROCESS_TYPE,
+        )
+        .into();
+        Ok(Some(self.output_process.0))
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
     shards::core::init(); // Ensure core is initialized
+
     shlog_debug!("Registering Memflow Shards...");
+
     register_shard::<MemflowOsShard>();
     register_shard::<MemflowProcessListShard>();
+    register_shard::<MemflowProcessShard>();
+
     shlog_debug!("Memflow Shards registered.");
 }
