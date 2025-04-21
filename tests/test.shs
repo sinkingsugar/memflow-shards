@@ -1,1 +1,2 @@
-Memflow.Os(Os: "native") | Log = memflow-os
+Memflow.Os(Os: "native") | Log = memflow/default-os ; this is a special variable that will be the default for any Memflow Shards
+Memflow.ProcessList | Log("Processes")
