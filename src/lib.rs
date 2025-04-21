@@ -114,7 +114,7 @@ impl Shard for MemflowOsShard {
         );
 
         // Create inventory and OS instance
-        let inventory = Inventory::scan();
+        let mut inventory = Inventory::scan();
 
         if connector_name != "" {
             let os = inventory

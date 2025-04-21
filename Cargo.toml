@@ -7,8 +7,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-shards = { version = "0.1.1", path = "../shards/shards/rust", features = ["dllshard"] } # Adjust path if needed
-memflow = "0.2.1" # Check for latest version if necessary
-ctor = "0.2"
+shards = { version = "0.1.1", path = "../shards/shards/rust", features = [
+  "dllshard",
+] } # Adjust path if needed
+memflow = { git = "https://github.com/sinkingsugar/memflow.git", branch = "main" }
+ctor = "0.4.1"
 lazy_static = "1.5.0"
 log = "0.4"
