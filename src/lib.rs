@@ -377,6 +377,105 @@ impl Shard for MemflowProcessShard {
     }
 }
 
+// Define the MemMap Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.MemMap",
+    "Retrieves memory mappings from a Memflow Process instance."
+)]
+struct MemflowMemMapShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("GapSize", "Size of gaps to ignore between memory regions (in bytes).", [common_type::int, common_type::int_var])]
+    gap_size: ParamVar,
+
+    // Output memory maps as table
+    mem_maps: AutoTableVar,
+}
+
+impl Default for MemflowMemMapShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            gap_size: ParamVar::new(0.into()),
+            mem_maps: AutoTableVar::new(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowMemMapShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANY_TABLE_TYPES // Outputs a table of memory mappings
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.mem_maps = AutoTableVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get gap size parameter
+        let gap_size: i64 = self.gap_size.get().as_ref().try_into()?;
+
+        shlog_debug!(
+            "Getting memory maps for process with gap size: {}",
+            gap_size
+        );
+
+        // Get memory maps
+        let maps = process.0.mapped_mem_vec(gap_size);
+
+        // Build output table with memory maps
+        for map in maps {
+            let address_str = format!("0x{:x}", map.0);
+            let size_str = format!("0x{:x}", map.1);
+            let prot = format!("{:?}", map.2);
+
+            // Create column values
+            let address_var = Var::ephemeral_string(&address_str);
+            let size_var = Var::ephemeral_string(&size_str);
+            let prot_var = Var::ephemeral_string(&prot);
+
+            // Insert into table
+            self.mem_maps.0.insert_fast_static("address", &address_var);
+            self.mem_maps.0.insert_fast_static("size", &size_var);
+            self.mem_maps.0.insert_fast_static("protection", &prot_var);
+        }
+
+        Ok(Some(self.mem_maps.0 .0))
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -387,6 +486,7 @@ fn register_memflow_shards() {
     register_shard::<MemflowOsShard>();
     register_shard::<MemflowProcessListShard>();
     register_shard::<MemflowProcessShard>();
+    register_shard::<MemflowMemMapShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }
