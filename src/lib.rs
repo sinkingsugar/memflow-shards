@@ -28,6 +28,9 @@ lazy_static! {
     static ref MEMFLOW_VENDOR_ID: i32 = fourCharacterCode(*b"MEMF"); // Example Vendor ID
     static ref MEMFLOW_OS_TYPE_ID: i32 = fourCharacterCode(*b"OS__"); // Example Type ID
     static ref MEMFLOW_PROCESS_TYPE_ID: i32 = fourCharacterCode(*b"PROC"); // Process Type ID
+    static ref MEMFLOW_MODULE_TYPE_ID: i32 = fourCharacterCode(*b"MODL"); // Module Type ID
+    static ref MEMFLOW_CACHED_PROCESS_TYPE_ID: i32 = fourCharacterCode(*b"CPRC"); // Cached Process Type ID
+
     // The Shards Type descriptor for the Inventory object
     pub static ref MEMFLOW_OS_TYPE: Type = Type::object(*MEMFLOW_VENDOR_ID, *MEMFLOW_OS_TYPE_ID);
     pub static ref MEMFLOW_OS_TYPE_VAR: Type = Type::context_variable(&[*MEMFLOW_OS_TYPE]);
@@ -38,6 +41,11 @@ lazy_static! {
     pub static ref MEMFLOW_PROCESS_TYPE: Type = Type::object(*MEMFLOW_VENDOR_ID, *MEMFLOW_PROCESS_TYPE_ID);
     pub static ref MEMFLOW_PROCESS_TYPE_VAR: Type = Type::context_variable(&[*MEMFLOW_PROCESS_TYPE]);
     pub static ref MEMFLOW_PROCESS_TYPES: Vec<Type> = vec![*MEMFLOW_PROCESS_TYPE];
+
+    // Module type definitions
+    pub static ref MEMFLOW_MODULE_TYPE: Type = Type::object(*MEMFLOW_VENDOR_ID, *MEMFLOW_MODULE_TYPE_ID);
+    pub static ref MEMFLOW_MODULE_TYPE_VAR: Type = Type::context_variable(&[*MEMFLOW_MODULE_TYPE]);
+    pub static ref MEMFLOW_MODULE_TYPES: Vec<Type> = vec![*MEMFLOW_MODULE_TYPE];
 }
 
 mod memflow_os_wrapper {
@@ -57,6 +65,16 @@ mod memflow_process_wrapper {
     pub struct MemflowProcessWrapper(pub ProcessInstanceArcBox<'static>);
 
     ref_counted_object_type_impl!(MemflowProcessWrapper);
+}
+
+mod memflow_module_wrapper {
+    use super::*;
+
+    // Module wrapper struct to hold the ModuleInfo
+    #[derive(Clone)]
+    pub struct MemflowModuleWrapper(pub ModuleInfo);
+
+    ref_counted_object_type_impl!(MemflowModuleWrapper);
 }
 
 // 4. Define the Shard struct
@@ -185,12 +203,40 @@ struct MemflowProcessListShard {
     process_list: AutoTableVar,
 }
 
+// Define the KernelModuleList Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.KernelModuleList",
+    "Returns a list of kernel modules from a Memflow OS instance."
+)]
+struct MemflowKernelModuleListShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters - OS instance to get kernel module list from
+    #[shard_param("Os", "The Memflow OS instance to get kernel module list from.", [*MEMFLOW_OS_TYPE, *MEMFLOW_OS_TYPE_VAR])]
+    os_instance: ParamVar,
+
+    // Output list of kernel modules as tables
+    module_list: AutoTableVar,
+}
+
 impl Default for MemflowProcessListShard {
     fn default() -> Self {
         Self {
             required: ExposedTypes::new(),
             os_instance: ParamVar::new_named("memflow/default-os"),
             process_list: AutoTableVar::new(),
+        }
+    }
+}
+
+impl Default for MemflowKernelModuleListShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            os_instance: ParamVar::new_named("memflow/default-os"),
+            module_list: AutoTableVar::new(),
         }
     }
 }
@@ -290,6 +336,27 @@ struct MemflowProcessShard {
     output_process: ClonedVar,
 }
 
+// Define the Module Info Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.ModuleInfo",
+    "Gets information about a specific module from a process."
+)]
+struct MemflowModuleInfoShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("Process", "The Memflow Process instance to get the module from.", [*MEMFLOW_PROCESS_TYPE, *MEMFLOW_PROCESS_TYPE_VAR])]
+    process_instance: ParamVar,
+
+    #[shard_param("Name", "Module name to search for.", [common_type::string, common_type::string_var])]
+    module_name: ParamVar,
+
+    // Store the output Module object
+    output_module: ClonedVar,
+}
+
 impl Default for MemflowProcessShard {
     fn default() -> Self {
         Self {
@@ -299,6 +366,79 @@ impl Default for MemflowProcessShard {
             process_pid: ParamVar::default(),
             output_process: ClonedVar::default(),
         }
+    }
+}
+
+impl Default for MemflowModuleInfoShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            process_instance: ParamVar::default(),
+            module_name: ParamVar::default(),
+            output_module: ClonedVar::default(),
+        }
+    }
+}
+#[shards::shard_impl]
+impl Shard for MemflowModuleInfoShard {
+    fn input_types(&mut self) -> &Types {
+        &NONE_TYPES // Takes no input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &MEMFLOW_MODULE_TYPES // Outputs our custom Module object
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        // Drop the Module instance when the shard is cleaned up
+        self.output_module = ClonedVar::default();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        _input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from parameter
+        let process_var = &self.process_instance.get();
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                process_var,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get module name parameter
+        let module_name: &str = self.module_name.get().as_ref().try_into()?;
+
+        shlog_debug!("Searching for module by name: {}", module_name);
+
+        // Find module by name
+        let module_info = process.0.module_by_name(module_name).map_err(|e| {
+            shlog_error!("Failed to find module by name '{}': {}", module_name, e);
+            "Module not found by name."
+        })?;
+
+        // Create and return the module object
+        self.output_module = Var::new_ref_counted(
+            memflow_module_wrapper::MemflowModuleWrapper(module_info),
+            &MEMFLOW_MODULE_TYPE,
+        )
+        .into();
+
+        Ok(Some(self.output_module.0))
     }
 }
 
@@ -476,6 +616,80 @@ impl Shard for MemflowMemMapShard {
     }
 }
 
+#[shards::shard_impl]
+impl Shard for MemflowKernelModuleListShard {
+    fn input_types(&mut self) -> &Types {
+        &NONE_TYPES // Takes no input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANY_TABLE_TYPES // Outputs sequence of module data tables
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.module_list = AutoTableVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        _input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the OS instance from parameter
+        let os_var = &self.os_instance.get();
+
+        let os = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_os_wrapper::MemflowOsWrapper>(
+                os_var,
+                &*MEMFLOW_OS_TYPE,
+            )?
+        };
+
+        shlog_debug!("Getting kernel module list from OS instance");
+
+        let module_list = os.0.module_list().map_err(|e| {
+            shlog_error!("Failed to get kernel module list: {}", e);
+            "Failed to get kernel module list."
+        })?;
+
+        for module in module_list {
+            // Create column values for module information
+            let name = Var::ephemeral_string(&module.name);
+            // let base_addr: Var = module.base.to_string();
+            // let base = Var::ephemeral_string(&base_addr);
+            let size: Var = module.size.into();
+            let path = Var::ephemeral_string(&module.path);
+
+            // Insert into table
+            self.module_list.0.insert_fast_static("name", &name);
+            // self.module_list.0.insert_fast_static("base", &base);
+            self.module_list.0.insert_fast_static("size", &size);
+            self.module_list.0.insert_fast_static("path", &path);
+
+            // // Store the internal address if available
+            // if let Some(addr) = module.address {
+            //     let addr_str = format!("0x{:x}", addr.as_u64());
+            //     let addr_var = Var::ephemeral_string(&addr_str);
+            //     self.module_list.0.insert_fast_static("address", &addr_var);
+            // }
+        }
+
+        Ok(Some(self.module_list.0 .0))
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -487,6 +701,8 @@ fn register_memflow_shards() {
     register_shard::<MemflowProcessListShard>();
     register_shard::<MemflowProcessShard>();
     register_shard::<MemflowMemMapShard>();
+    register_shard::<MemflowKernelModuleListShard>();
+    register_shard::<MemflowModuleInfoShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }
