@@ -2,18 +2,7 @@ use shards::core::register_shard;
 use shards::ref_counted_object_type_impl;
 use shards::shard::Shard;
 use shards::types::{
-    common_type,
-    AutoTableVar,
-    ClonedVar,
-    Context,
-    ExposedTypes,
-    InstanceData,
-    ParamVar,
-    Type,
-    Types,
-    Var,
-    ANY_TABLE_TYPES,
-    NONE_TYPES, // Input type
+    common_type, AutoSeqVar, AutoTableVar, ClonedVar, Context, ExposedTypes, InstanceData, ParamVar, Type, Types, Var, ANYS_TYPES, ANY_TABLE_TYPES, NONE_TYPES // Input type
 };
 use shards::{fourCharacterCode, shlog_debug, shlog_error};
 
@@ -218,7 +207,7 @@ struct MemflowKernelModuleListShard {
     os_instance: ParamVar,
 
     // Output list of kernel modules as tables
-    module_list: AutoTableVar,
+    module_list: AutoSeqVar,
 }
 
 impl Default for MemflowProcessListShard {
@@ -236,7 +225,7 @@ impl Default for MemflowKernelModuleListShard {
         Self {
             required: ExposedTypes::new(),
             os_instance: ParamVar::new_named("memflow/default-os"),
-            module_list: AutoTableVar::new(),
+            module_list: AutoSeqVar::new(),
         }
     }
 }
@@ -535,7 +524,7 @@ struct MemflowMemMapShard {
     gap_size: ParamVar,
 
     // Output memory maps as table
-    mem_maps: AutoTableVar,
+    mem_maps: AutoSeqVar,
 }
 
 impl Default for MemflowMemMapShard {
@@ -543,7 +532,7 @@ impl Default for MemflowMemMapShard {
         Self {
             required: ExposedTypes::new(),
             gap_size: ParamVar::new(0.into()),
-            mem_maps: AutoTableVar::new(),
+            mem_maps: AutoSeqVar::new(),
         }
     }
 }
@@ -555,7 +544,7 @@ impl Shard for MemflowMemMapShard {
     }
 
     fn output_types(&mut self) -> &Types {
-        &ANY_TABLE_TYPES // Outputs a table of memory mappings
+        &ANYS_TYPES // Outputs a table of memory mappings
     }
 
     fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
@@ -569,7 +558,7 @@ impl Shard for MemflowMemMapShard {
     }
 
     fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
-        self.mem_maps = AutoTableVar::new();
+        self.mem_maps = AutoSeqVar::new();
         self.cleanup_helper(ctx)?;
         Ok(())
     }
@@ -610,9 +599,11 @@ impl Shard for MemflowMemMapShard {
             let prot_var = Var::ephemeral_string(&prot);
 
             // Insert into table
-            self.mem_maps.0.insert_fast_static("address", &address_var);
-            self.mem_maps.0.insert_fast_static("size", &size_var);
-            self.mem_maps.0.insert_fast_static("protection", &prot_var);
+            let mut tab = AutoTableVar::new();
+            tab.0.insert_fast_static("address", &address_var);
+            tab.0.insert_fast_static("size", &size_var);
+            tab.0.insert_fast_static("protection", &prot_var);
+            self.mem_maps.0.emplace_table(tab);
         }
 
         Ok(Some(self.mem_maps.0 .0))
@@ -626,7 +617,7 @@ impl Shard for MemflowKernelModuleListShard {
     }
 
     fn output_types(&mut self) -> &Types {
-        &ANY_TABLE_TYPES // Outputs sequence of module data tables
+        &ANYS_TYPES // Outputs sequence of module data tables
     }
 
     fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
@@ -640,7 +631,7 @@ impl Shard for MemflowKernelModuleListShard {
     }
 
     fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
-        self.module_list = AutoTableVar::new();
+        self.module_list = AutoSeqVar::new();
         self.cleanup_helper(ctx)?;
         Ok(())
     }
@@ -676,10 +667,13 @@ impl Shard for MemflowKernelModuleListShard {
             let path = Var::ephemeral_string(&module.path);
 
             // Insert into table
-            self.module_list.0.insert_fast_static("name", &name);
+            let mut tab = AutoTableVar::new();
+            tab.0.insert_fast_static("name", &name);
             // self.module_list.0.insert_fast_static("base", &base);
-            self.module_list.0.insert_fast_static("size", &size);
-            self.module_list.0.insert_fast_static("path", &path);
+            tab.0.insert_fast_static("size", &size);
+            tab.0.insert_fast_static("path", &path);
+
+            self.module_list.0.emplace_table(tab);
 
             // // Store the internal address if available
             // if let Some(addr) = module.address {

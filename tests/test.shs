@@ -1,3 +1,7 @@
 Memflow.Os(Connector: "kvm" Os: "win32") | Log = memflow/default-os ; this is a special variable that will be the default for any Memflow Shards
 Memflow.ProcessList | Log("Processes")
+
 Memflow.Process(Pid: 6796) | Log("Process")
+Memflow.MemMap | Log("Memory Map")
+
+Memflow.KernelModuleList | Log("Kernel Modules")
