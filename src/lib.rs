@@ -290,22 +290,25 @@ impl Shard for MemflowProcessListShard {
         })?;
 
         for process in process_list {
+            let mut process_table = AutoTableVar::new();
+
             let name = process.name.to_string();
             let name_str = Var::ephemeral_string(&name);
-            self.process_list.0.insert_fast_static("name", &name_str);
+            process_table.0.insert_fast_static("name", &name_str);
 
             let pid: Var = process.pid.into();
-            self.process_list.0.insert_fast_static("pid", &pid);
 
             let path = process.path.to_string();
             let path_str = Var::ephemeral_string(&path);
-            self.process_list.0.insert_fast_static("path", &path_str);
+            process_table.0.insert_fast_static("path", &path_str);
 
             let command_line = process.command_line.to_string();
             let command_line_str = Var::ephemeral_string(&command_line);
-            self.process_list
+            process_table
                 .0
                 .insert_fast_static("command_line", &command_line_str);
+
+            self.process_list.0.emplace_table(pid, process_table);
         }
 
         Ok(Some(self.process_list.0 .0))

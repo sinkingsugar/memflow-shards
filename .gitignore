@@ -1,3 +1,4 @@
 /target
 *.dylib
 *.log
+tests/externals/memflow.so
