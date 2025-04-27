@@ -1883,8 +1883,7 @@ impl Shard for MemflowPatternScanShard {
 
                 // Filter by protection
                 if let Some(prot_filter) = protection_filter {
-                    let prot_str = format!("{:?}", map.2);
-                    if !prot_str.contains(prot_filter) {
+                    if !protection_filter_matches(map.2, prot_filter) {
                         return false;
                     }
                 }
