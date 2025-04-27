@@ -2,7 +2,20 @@ use shards::core::register_shard;
 use shards::ref_counted_object_type_impl;
 use shards::shard::Shard;
 use shards::types::{
-    common_type, AutoSeqVar, AutoTableVar, ClonedVar, Context, ExposedTypes, InstanceData, ParamVar, Type, Types, Var, ANYS_TYPES, ANY_TABLE_TYPES, NONE_TYPES // Input type
+    common_type,
+    AutoSeqVar,
+    AutoTableVar,
+    ClonedVar,
+    Context,
+    ExposedTypes,
+    InstanceData,
+    ParamVar,
+    Type,
+    Types,
+    Var,
+    ANYS_TYPES,
+    ANY_TABLE_TYPES,
+    NONE_TYPES, // Input type
 };
 use shards::{fourCharacterCode, shlog_debug, shlog_error};
 
@@ -589,20 +602,15 @@ impl Shard for MemflowMemMapShard {
 
         // Build output table with memory maps
         for map in maps {
-            let address_str = format!("0x{:x}", map.0);
-            let size_str = format!("0x{:x}", map.1);
-            let prot = format!("{:?}", map.2);
-
-            // Create column values
-            let address_var = Var::ephemeral_string(&address_str);
-            let size_var = Var::ephemeral_string(&size_str);
-            let prot_var = Var::ephemeral_string(&prot);
+            let address: Var = map.0.to_umem().into();
+            let size: Var = map.1.to_umem().into();
+            let prot: Var = Var::ephemeral_string(&format!("{:?}", map.2));
 
             // Insert into table
             let mut tab = AutoTableVar::new();
-            tab.0.insert_fast_static("address", &address_var);
-            tab.0.insert_fast_static("size", &size_var);
-            tab.0.insert_fast_static("protection", &prot_var);
+            tab.0.insert_fast_static("address", &address);
+            tab.0.insert_fast_static("size", &size);
+            tab.0.insert_fast_static("protection", &prot);
             self.mem_maps.0.emplace_table(tab);
         }
 
@@ -660,27 +668,21 @@ impl Shard for MemflowKernelModuleListShard {
 
         for module in module_list {
             // Create column values for module information
-            let name = Var::ephemeral_string(&module.name);
-            // let base_addr: Var = module.base.to_string();
-            // let base = Var::ephemeral_string(&base_addr);
+            let address: Var = module.address.to_umem().into();
+            let base: Var = module.base.to_umem().into();
             let size: Var = module.size.into();
+            let name = Var::ephemeral_string(&module.name);
             let path = Var::ephemeral_string(&module.path);
 
             // Insert into table
             let mut tab = AutoTableVar::new();
-            tab.0.insert_fast_static("name", &name);
-            // self.module_list.0.insert_fast_static("base", &base);
+            tab.0.insert_fast_static("address", &address);
+            tab.0.insert_fast_static("base", &base);
             tab.0.insert_fast_static("size", &size);
+            tab.0.insert_fast_static("name", &name);
             tab.0.insert_fast_static("path", &path);
 
             self.module_list.0.emplace_table(tab);
-
-            // // Store the internal address if available
-            // if let Some(addr) = module.address {
-            //     let addr_str = format!("0x{:x}", addr.as_u64());
-            //     let addr_var = Var::ephemeral_string(&addr_str);
-            //     self.module_list.0.insert_fast_static("address", &addr_var);
-            // }
         }
 
         Ok(Some(self.module_list.0 .0))
