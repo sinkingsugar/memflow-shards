@@ -1026,7 +1026,7 @@ impl Shard for MemflowProcessModuleListShard {
             self.module_list.0.emplace_table(tab);
         }
 
-        Ok(Some(self.module_list.0.0))
+        Ok(Some(self.module_list.0 .0))
     }
 }
 
@@ -1133,6 +1133,146 @@ impl Shard for MemflowWriteMemoryShard {
     }
 }
 
+// Define the BatchWriteMemory Shard for more efficient writing
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.BatchWriteMemory",
+    "Writes memory to multiple addresses in a process using batched operations."
+)]
+struct MemflowBatchWriteMemoryShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters - table of addresses and data
+    #[shard_param("Writes", "Table of memory writes with 'address' and 'data' fields.", [common_type::any_table, common_type::any_table_var])]
+    writes: ParamVar,
+
+    #[shard_param("Process", "The Memflow Process instance to write to.", [*MEMFLOW_PROCESS_TYPE, *MEMFLOW_PROCESS_TYPE_VAR])]
+    process_instance: ParamVar,
+
+    // Output status
+    output_status: ClonedVar,
+}
+
+impl Default for MemflowBatchWriteMemoryShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            writes: ParamVar::default(),
+            process_instance: ParamVar::default(),
+            output_status: ClonedVar::default(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowBatchWriteMemoryShard {
+    fn input_types(&mut self) -> &Types {
+        &NONE_TYPES // Takes no input, all data comes from parameters
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &NONE_TYPES // No output, just success/failure
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        if self.writes.is_none() {
+            return Err("Missing 'writes' parameter");
+        }
+        self.output_status = ClonedVar::default();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        _input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from parameter
+        let process_var = &self.process_instance.get();
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                process_var,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get writes table
+        let writes_var = self.writes.get();
+        let writes_table = writes_var.as_table()?;
+
+        shlog_debug!("Performing batch memory write operation");
+
+        // Prepare data for batch operations
+        struct WriteOp {
+            address: umem,
+            data: Vec<u8>,
+        }
+
+        let mut write_ops = Vec::new();
+
+        // Collect all write operations first
+        for (key, _) in writes_table.iter() {
+            let write_entry = writes_table.get(key).unwrap();
+            let write_table = write_entry.as_table()?;
+
+            // Get address and data from the table
+            let address_var = write_table
+                .get(Var::ephemeral_string("address"))
+                .ok_or("Missing 'address' field in write entry")?;
+            let data_var = write_table
+                .get(Var::ephemeral_string("data"))
+                .ok_or("Missing 'data' field in write entry")?;
+
+            let address: i64 = address_var.as_ref().try_into()?;
+            let data: &[u8] = data_var.try_into()?;
+
+            if data.is_empty() {
+                return Err("Empty data in write entry");
+            }
+
+            let address_umem = address as umem;
+
+            // Create write operation
+            write_ops.push(WriteOp {
+                address: address_umem,
+                data: data.to_vec(),
+            });
+        }
+
+        // Now perform the batch write
+        {
+            let mut batcher = process.0.batcher();
+
+            // Set up all write operations in the batcher
+            for op in &write_ops {
+                batcher.write_raw_into(Address::from(op.address), &op.data);
+            }
+
+            // Execute all write operations in batch
+            batcher.commit_rw().map_err(|e| {
+                shlog_error!("Failed to execute batch memory write: {}", e);
+                "Failed to write memory to process."
+            })?;
+        }
+
+        // Return success
+        self.output_status = Var::new_bool(true).into();
+        Ok(None)
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -1150,6 +1290,7 @@ fn register_memflow_shards() {
     register_shard::<MemflowBatchReadMemoryShard>();
     register_shard::<MemflowProcessModuleListShard>();
     register_shard::<MemflowWriteMemoryShard>();
+    register_shard::<MemflowBatchWriteMemoryShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }
