@@ -1,7 +1,11 @@
 Memflow.Os(Connector: "kvm" Os: "win32") | Log = memflow/default-os ; this is a special variable that will be the default for any Memflow Shards
-Memflow.ProcessList | Log("Processes")
+; Memflow.ProcessList | ForEach(Log("Process"))
 
-Memflow.Process(Pid: 6796) | Log("Process")
-Memflow.MemMap | Log("Memory Map")
+; Memflow.Process(Pid: 6796) | Log("Process")
+; Memflow.MemMap | Log("Memory Map")
+; Memflow.KernelModuleList | Log("Kernel Modules")
 
-Memflow.KernelModuleList | Log("Kernel Modules")
+Memflow.Process(Pid: 8268) = notepad.exe ; a notepad.exe process
+Memflow.MemoryScan(ValueType: "bytes" Value: ("Hello memflow shards!" | String.ToUTF16)) | Log("Memory Scan")
+Take(0) | ExpectTable | Take("address") | ExpectInt = mem-address
+"X" | StringToBytes | Memflow.WriteMemory(Address: mem-address Process: notepad.exe)
