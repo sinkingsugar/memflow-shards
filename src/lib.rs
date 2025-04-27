@@ -938,6 +938,201 @@ impl Shard for MemflowBatchReadMemoryShard {
     }
 }
 
+// Define the ProcessModuleList Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.ProcessModuleList",
+    "Returns a list of modules from a specific process."
+)]
+struct MemflowProcessModuleListShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Output list of modules as sequence of tables
+    module_list: AutoSeqVar,
+}
+
+impl Default for MemflowProcessModuleListShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            module_list: AutoSeqVar::new(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowProcessModuleListShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANYS_TYPES // Outputs sequence of module data tables
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.module_list = AutoSeqVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        shlog_debug!("Getting module list from process");
+
+        let module_list = process.0.module_list().map_err(|e| {
+            shlog_error!("Failed to get process module list: {}", e);
+            "Failed to get process module list."
+        })?;
+
+        for module in module_list {
+            // Create column values for module information
+            let base: Var = module.base.to_umem().into();
+            let size: Var = module.size.into();
+            let name = Var::ephemeral_string(&module.name);
+            let path = Var::ephemeral_string(&module.path);
+            let arch = Var::ephemeral_string(&format!("{:?}", module.arch));
+
+            // Insert into table
+            let mut tab = AutoTableVar::new();
+            tab.0.insert_fast_static("base", &base);
+            tab.0.insert_fast_static("size", &size);
+            tab.0.insert_fast_static("name", &name);
+            tab.0.insert_fast_static("path", &path);
+            tab.0.insert_fast_static("arch", &arch);
+
+            self.module_list.0.emplace_table(tab);
+        }
+
+        Ok(Some(self.module_list.0.0))
+    }
+}
+
+// Define the WriteMemory Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.WriteMemory",
+    "Writes memory to a specific address in a process."
+)]
+struct MemflowWriteMemoryShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("Address", "Memory address to write to.", [common_type::int, common_type::int_var])]
+    address: ParamVar,
+
+    #[shard_param("Process", "The Memflow Process instance to write to.", [*MEMFLOW_PROCESS_TYPE, *MEMFLOW_PROCESS_TYPE_VAR])]
+    process_instance: ParamVar,
+
+    // Output status
+    output_status: ClonedVar,
+}
+
+impl Default for MemflowWriteMemoryShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            address: ParamVar::new(0.into()),
+            process_instance: ParamVar::default(),
+            output_status: ClonedVar::default(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowWriteMemoryShard {
+    fn input_types(&mut self) -> &Types {
+        &BYTES_TYPES // Takes bytes as input to write
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &NONE_TYPES // No output, just success/failure
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.output_status = ClonedVar::default();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from parameter
+        let process_var = &self.process_instance.get();
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                process_var,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get address parameter
+        let address: i64 = self.address.get().as_ref().try_into()?;
+        let address_umem = address as umem;
+
+        // Get data to write from input
+        let data: &[u8] = input.try_into()?;
+        if data.is_empty() {
+            return Err("No data to write");
+        }
+
+        shlog_debug!(
+            "Writing memory at address: 0x{:x}, size: {} bytes",
+            address_umem,
+            data.len()
+        );
+
+        // Write memory
+        process
+            .0
+            .write_raw(Address::from(address_umem), data)
+            .map_err(|e| {
+                shlog_error!("Failed to write memory: {}", e);
+                "Failed to write memory to process."
+            })?;
+
+        // Return success
+        self.output_status = Var::new_bool(true).into();
+        Ok(None)
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -953,6 +1148,8 @@ fn register_memflow_shards() {
     register_shard::<MemflowModuleInfoShard>();
     register_shard::<MemflowReadMemoryShard>();
     register_shard::<MemflowBatchReadMemoryShard>();
+    register_shard::<MemflowProcessModuleListShard>();
+    register_shard::<MemflowWriteMemoryShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }
