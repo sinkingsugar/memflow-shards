@@ -1,3 +1,4 @@
+use protection_filter::protection_filter_matches;
 use shards::core::register_shard;
 use shards::ref_counted_object_type_impl;
 use shards::shard::Shard;
@@ -10,6 +11,7 @@ use shards::types::{
     ExposedTypes,
     InstanceData,
     ParamVar,
+    TableVar,
     Type,
     Types,
     Var,
@@ -24,6 +26,8 @@ use ctor::ctor;
 use lazy_static::lazy_static;
 
 use memflow::prelude::v1::*;
+
+mod protection_filter;
 
 // 1. Define static types for the Memflow Inventory object
 lazy_static! {
@@ -1273,6 +1277,716 @@ impl Shard for MemflowBatchWriteMemoryShard {
     }
 }
 
+// Define the MemoryScan Shard for basic memory scanning
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.MemoryScan",
+    "Scans process memory for specific values or patterns."
+)]
+struct MemflowMemoryScanShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("ValueType", "Type of value to scan for: 'int', 'float', 'double', 'string', 'bytes'.", [common_type::string, common_type::string_var])]
+    value_type: ParamVar,
+
+    #[shard_param("Value", "Value to scan for.", [common_type::any, common_type::any_var])]
+    value: ParamVar,
+
+    #[shard_param("Alignment", "Memory alignment for the scan (default: 1).", [common_type::none, common_type::int, common_type::int_var])]
+    alignment: ParamVar,
+
+    #[shard_param("MinSize", "Minimum size of memory regions to scan (default: 4096).", [common_type::none, common_type::int, common_type::int_var])]
+    min_size: ParamVar,
+
+    #[shard_param("MaxSize", "Maximum size of memory regions to scan (default: no limit).", [common_type::none, common_type::int, common_type::int_var])]
+    max_size: ParamVar,
+
+    #[shard_param("Protection", "Memory protection to filter by (e.g., 'r--', 'rw-', 'r-x').", [common_type::none, common_type::string, common_type::string_var])]
+    protection: ParamVar,
+
+    #[shard_param("PreviousScan", "Results from a previous scan for incremental scanning.", [common_type::none, common_type::any_table, common_type::any_table_var])]
+    previous_scan: ParamVar,
+
+    #[shard_param("CompareType", "For incremental scans: 'equal', 'notequal', 'greater', 'less', 'changed', 'unchanged'.", [common_type::none, common_type::string, common_type::string_var])]
+    compare_type: ParamVar,
+
+    // Output results
+    scan_results: AutoSeqVar,
+}
+
+impl Default for MemflowMemoryScanShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            value_type: ParamVar::new(Var::ephemeral_string("int")),
+            value: ParamVar::default(),
+            alignment: ParamVar::new(1.into()),
+            min_size: ParamVar::new(4096.into()),
+            max_size: ParamVar::default(),
+            protection: ParamVar::default(),
+            previous_scan: ParamVar::default(),
+            compare_type: ParamVar::default(),
+            scan_results: AutoSeqVar::new(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowMemoryScanShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANYS_TYPES // Outputs a sequence of results
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.scan_results = AutoSeqVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get parameters
+        let value_type: &str = self.value_type.get().as_ref().try_into()?;
+        let alignment: i64 = self.alignment.get().as_ref().try_into().unwrap_or(1);
+        let min_size: i64 = self.min_size.get().as_ref().try_into().unwrap_or(4096);
+        let max_size: Option<i64> = if self.max_size.get().is_none() {
+            None
+        } else {
+            Some(self.max_size.get().as_ref().try_into()?)
+        };
+
+        // Parse protection filter if provided
+        let protection_filter = if self.protection.get().is_none() {
+            None
+        } else {
+            let prot_str: &str = self.protection.get().as_ref().try_into()?;
+            Some(prot_str)
+        };
+
+        // Get memory maps with filtering
+        let maps = process.0.mapped_mem_vec(0);
+        let filtered_maps: Vec<_> = maps
+            .into_iter()
+            .filter(|map| {
+                // Filter by size
+                let size = map.1.to_umem() as i64;
+                if size < min_size {
+                    return false;
+                }
+                if let Some(max) = max_size {
+                    if size > max {
+                        return false;
+                    }
+                }
+
+                // Filter by protection
+                if let Some(prot_filter) = protection_filter {
+                    if !protection_filter_matches(map.2, prot_filter) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        shlog_debug!(
+            "Scanning memory with value type: {}, filtered to {} regions",
+            value_type,
+            filtered_maps.len()
+        );
+
+        // Prepare the value to search for
+        let search_value = match value_type {
+            "int" => {
+                let val: i64 = self.value.get().as_ref().try_into()?;
+                ScanValue::Integer(val)
+            }
+            "float" => {
+                let val: f32 = self.value.get().as_ref().try_into()?;
+                ScanValue::Float(val)
+            }
+            "double" => {
+                let val: f64 = self.value.get().as_ref().try_into()?;
+                ScanValue::Double(val)
+            }
+            "string" => {
+                let val: &str = self.value.get().as_ref().try_into()?;
+                ScanValue::String(val.to_string())
+            }
+            "bytes" => {
+                let val: &[u8] = self.value.get().as_ref().try_into()?;
+                ScanValue::Bytes(val.to_vec())
+            }
+            _ => return Err("Unsupported value type"),
+        };
+
+        // Check if this is an incremental scan
+        let incremental_scan = !self.previous_scan.get().is_none();
+        let compare_type = if incremental_scan {
+            let compare_type_str: &str = self.compare_type.get().as_ref().try_into()?;
+            Some(match compare_type_str {
+                "equal" => CompareType::Equal,
+                "notequal" => CompareType::NotEqual,
+                "greater" => CompareType::Greater,
+                "less" => CompareType::Less,
+                "changed" => CompareType::Changed,
+                "unchanged" => CompareType::Unchanged,
+                _ => return Err("Unsupported compare type"),
+            })
+        } else {
+            None
+        };
+
+        // Get previous scan results if this is an incremental scan
+        let previous_results = if incremental_scan {
+            let prev_var = self.previous_scan.get();
+            let prev_table = prev_var.as_table()?;
+            Some(prev_table)
+        } else {
+            None
+        };
+
+        // Perform the scan
+        let mut results = Vec::new();
+        let alignment_usize = alignment as usize;
+
+        for map in filtered_maps {
+            let base_addr = map.0.to_umem();
+            let size = map.1.to_umem() as usize;
+
+            // Skip regions that are too small
+            if size < search_value.size() {
+                continue;
+            }
+
+            // Read the memory region
+            let mut buffer = vec![0u8; size];
+            match process
+                .0
+                .read_raw_into(Address::from(base_addr), &mut buffer)
+            {
+                Ok(_) => {
+                    // Scan the buffer for matches
+                    let matches = scan_buffer(
+                        &buffer,
+                        &search_value,
+                        alignment_usize,
+                        base_addr,
+                        previous_results,
+                        compare_type.as_ref(),
+                    );
+                    results.extend(matches);
+                }
+                Err(e) => {
+                    shlog_debug!("Failed to read memory region at 0x{:x}: {}", base_addr, e);
+                    continue;
+                }
+            }
+        }
+
+        // Build results table
+        for result in results {
+            let address: Var = result.address.into();
+            let value = match &search_value {
+                ScanValue::Integer(_) => Var::new_int(result.value_int),
+                ScanValue::Float(_) => Var::new_float(result.value_float.into()),
+                ScanValue::Double(_) => Var::new_float(result.value_double),
+                ScanValue::String(_) => Var::ephemeral_string(&result.value_string),
+                ScanValue::Bytes(_) => Var::ephemeral_slice(result.value_bytes.as_slice()),
+            };
+
+            let mut result_entry = AutoTableVar::new();
+            result_entry.0.insert_fast_static("address", &address);
+            result_entry.0.insert_fast_static("value", &value);
+
+            self.scan_results.0.emplace_table(result_entry);
+        }
+
+        Ok(Some(self.scan_results.0 .0))
+    }
+}
+
+// Helper enum for scan value types
+enum ScanValue {
+    Integer(i64),
+    Float(f32),
+    Double(f64),
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+impl ScanValue {
+    fn size(&self) -> usize {
+        match self {
+            ScanValue::Integer(_) => std::mem::size_of::<i64>(),
+            ScanValue::Float(_) => std::mem::size_of::<f32>(),
+            ScanValue::Double(_) => std::mem::size_of::<f64>(),
+            ScanValue::String(s) => s.len(),
+            ScanValue::Bytes(b) => b.len(),
+        }
+    }
+}
+
+// Helper enum for comparison types in incremental scans
+enum CompareType {
+    Equal,
+    NotEqual,
+    Greater,
+    Less,
+    Changed,
+    Unchanged,
+}
+
+// Helper struct for scan results
+struct ScanResult {
+    address: i64,
+    value_int: i64,
+    value_float: f32,
+    value_double: f64,
+    value_string: String,
+    value_bytes: Vec<u8>,
+}
+
+// Helper function to scan a buffer for matches
+fn scan_buffer(
+    buffer: &[u8],
+    search_value: &ScanValue,
+    alignment: usize,
+    base_addr: umem,
+    previous_results: Option<&TableVar>,
+    compare_type: Option<&CompareType>,
+) -> Vec<ScanResult> {
+    let mut results = Vec::new();
+    let value_size = search_value.size();
+
+    // If this is an incremental scan, we only check addresses from previous results
+    if let (Some(prev_results), Some(compare_type)) = (previous_results, compare_type) {
+        for (key, _) in prev_results.iter() {
+            let entry = prev_results.get(key).unwrap();
+            let entry_table = match entry.as_table() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let addr_var = match entry_table.get(Var::ephemeral_string("address")) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let addr: i64 = match addr_var.as_ref().try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            let offset = (addr as umem - base_addr) as usize;
+            if offset + value_size > buffer.len() {
+                continue;
+            }
+
+            let prev_value = match entry_table.get(Var::ephemeral_string("value")) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let matches = match search_value {
+                ScanValue::Integer(search_int) => {
+                    if offset + std::mem::size_of::<i64>() > buffer.len() {
+                        continue;
+                    }
+                    let current_value = i64::from_ne_bytes(
+                        buffer[offset..offset + std::mem::size_of::<i64>()]
+                            .try_into()
+                            .unwrap_or([0; 8]),
+                    );
+                    let prev_int: i64 = match prev_value.as_ref().try_into() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    match compare_type {
+                        CompareType::Equal => current_value == *search_int,
+                        CompareType::NotEqual => current_value != *search_int,
+                        CompareType::Greater => current_value > *search_int,
+                        CompareType::Less => current_value < *search_int,
+                        CompareType::Changed => current_value != prev_int,
+                        CompareType::Unchanged => current_value == prev_int,
+                    }
+                }
+                // Similar implementations for other types...
+                _ => false, // Simplified for now
+            };
+
+            if matches {
+                // Add to results
+                let result = create_scan_result(buffer, offset, addr, search_value);
+                results.push(result);
+            }
+        }
+    } else {
+        // First scan - check all memory
+        for offset in (0..buffer.len().saturating_sub(value_size)).step_by(alignment) {
+            let matches = match search_value {
+                ScanValue::Integer(val) => {
+                    if offset + std::mem::size_of::<i64>() > buffer.len() {
+                        continue;
+                    }
+                    let current_value = i64::from_ne_bytes(
+                        buffer[offset..offset + std::mem::size_of::<i64>()]
+                            .try_into()
+                            .unwrap_or([0; 8]),
+                    );
+                    current_value == *val
+                }
+                ScanValue::Float(val) => {
+                    if offset + std::mem::size_of::<f32>() > buffer.len() {
+                        continue;
+                    }
+                    let current_value = f32::from_ne_bytes(
+                        buffer[offset..offset + std::mem::size_of::<f32>()]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
+                    (current_value - *val).abs() < f32::EPSILON
+                }
+                ScanValue::Double(val) => {
+                    if offset + std::mem::size_of::<f64>() > buffer.len() {
+                        continue;
+                    }
+                    let current_value = f64::from_ne_bytes(
+                        buffer[offset..offset + std::mem::size_of::<f64>()]
+                            .try_into()
+                            .unwrap_or([0; 8]),
+                    );
+                    (current_value - *val).abs() < f64::EPSILON
+                }
+                ScanValue::String(val) => {
+                    if offset + val.len() > buffer.len() {
+                        continue;
+                    }
+                    let slice = &buffer[offset..offset + val.len()];
+                    slice == val.as_bytes()
+                }
+                ScanValue::Bytes(val) => {
+                    if offset + val.len() > buffer.len() {
+                        continue;
+                    }
+                    let slice = &buffer[offset..offset + val.len()];
+                    slice == val.as_slice()
+                }
+            };
+
+            if matches {
+                let addr = base_addr + offset as umem;
+                let result = create_scan_result(buffer, offset, addr as i64, search_value);
+                results.push(result);
+            }
+        }
+    }
+
+    results
+}
+
+// Helper function to create a scan result
+fn create_scan_result(
+    buffer: &[u8],
+    offset: usize,
+    address: i64,
+    search_value: &ScanValue,
+) -> ScanResult {
+    let mut result = ScanResult {
+        address,
+        value_int: 0,
+        value_float: 0.0,
+        value_double: 0.0,
+        value_string: String::new(),
+        value_bytes: Vec::new(),
+    };
+
+    match search_value {
+        ScanValue::Integer(_) => {
+            if offset + std::mem::size_of::<i64>() <= buffer.len() {
+                result.value_int = i64::from_ne_bytes(
+                    buffer[offset..offset + std::mem::size_of::<i64>()]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
+            }
+        }
+        ScanValue::Float(_) => {
+            if offset + std::mem::size_of::<f32>() <= buffer.len() {
+                result.value_float = f32::from_ne_bytes(
+                    buffer[offset..offset + std::mem::size_of::<f32>()]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                );
+            }
+        }
+        ScanValue::Double(_) => {
+            if offset + std::mem::size_of::<f64>() <= buffer.len() {
+                result.value_double = f64::from_ne_bytes(
+                    buffer[offset..offset + std::mem::size_of::<f64>()]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
+            }
+        }
+        ScanValue::String(val) => {
+            if offset + val.len() <= buffer.len() {
+                let slice = &buffer[offset..offset + val.len()];
+                result.value_string = String::from_utf8_lossy(slice).to_string();
+            }
+        }
+        ScanValue::Bytes(val) => {
+            if offset + val.len() <= buffer.len() {
+                result.value_bytes = buffer[offset..offset + val.len()].to_vec();
+            }
+        }
+    }
+
+    result
+}
+
+// Define a more advanced memory scanner for pattern matching
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.PatternScan",
+    "Scans process memory for byte patterns with wildcards."
+)]
+struct MemflowPatternScanShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("Pattern", "Byte pattern to scan for (e.g., '48 8B ? ? 89 7C').", [common_type::string, common_type::string_var])]
+    pattern: ParamVar,
+
+    #[shard_param("MinSize", "Minimum size of memory regions to scan (default: 4096).", [common_type::none, common_type::int, common_type::int_var])]
+    min_size: ParamVar,
+
+    #[shard_param("Protection", "Memory protection to filter by (e.g., 'r--', 'rw-', 'r-x').", [common_type::none, common_type::string, common_type::string_var])]
+    protection: ParamVar,
+
+    // Output results
+    scan_results: AutoSeqVar,
+}
+
+impl Default for MemflowPatternScanShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            pattern: ParamVar::default(),
+            min_size: ParamVar::new(4096.into()),
+            protection: ParamVar::default(),
+            scan_results: AutoSeqVar::new(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowPatternScanShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANYS_TYPES // Outputs a sequence of results
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.scan_results = AutoSeqVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get parameters
+        let pattern_str: &str = self.pattern.get().as_ref().try_into()?;
+        let min_size: i64 = self.min_size.get().as_ref().try_into().unwrap_or(4096);
+
+        // Parse protection filter if provided
+        let protection_filter = if self.protection.get().is_none() {
+            None
+        } else {
+            let prot_str: &str = self.protection.get().as_ref().try_into()?;
+            Some(prot_str)
+        };
+
+        // Parse the pattern
+        let pattern = parse_pattern(pattern_str).map_err(|e| e)?;
+
+        if pattern.is_empty() {
+            return Err("Empty pattern");
+        }
+
+        shlog_debug!("Scanning memory with pattern: {}", pattern_str);
+
+        // Get memory maps with filtering
+        let maps = process.0.mapped_mem_vec(0);
+        let filtered_maps: Vec<_> = maps
+            .into_iter()
+            .filter(|map| {
+                // Filter by size
+                let size = map.1.to_umem() as i64;
+                if size < min_size {
+                    return false;
+                }
+
+                // Filter by protection
+                if let Some(prot_filter) = protection_filter {
+                    let prot_str = format!("{:?}", map.2);
+                    if !prot_str.contains(prot_filter) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        shlog_debug!("Filtered to {} memory regions", filtered_maps.len());
+
+        // Perform the scan
+        let mut results = Vec::new();
+
+        for map in filtered_maps {
+            let base_addr = map.0.to_umem();
+            let size = map.1.to_umem() as usize;
+
+            // Skip regions that are too small
+            if size < pattern.len() {
+                continue;
+            }
+
+            // Read the memory region
+            let mut buffer = vec![0u8; size];
+            match process
+                .0
+                .read_raw_into(Address::from(base_addr), &mut buffer)
+            {
+                Ok(_) => {
+                    // Scan the buffer for pattern matches
+                    let matches = scan_pattern(&buffer, &pattern, base_addr);
+                    results.extend(matches);
+                }
+                Err(e) => {
+                    shlog_debug!("Failed to read memory region at 0x{:x}: {}", base_addr, e);
+                    continue;
+                }
+            }
+        }
+
+        // Build results table
+        for address in results {
+            let addr_var: Var = address.into();
+            self.scan_results.0.push(&addr_var);
+        }
+
+        Ok(Some(self.scan_results.0 .0))
+    }
+}
+
+// Pattern element can be either a specific byte or a wildcard
+enum PatternElement {
+    Byte(u8),
+    Wildcard,
+}
+
+// Parse a pattern string into a vector of pattern elements
+fn parse_pattern(pattern: &str) -> std::result::Result<Vec<PatternElement>, &'static str> {
+    let mut result = Vec::new();
+    let parts: Vec<&str> = pattern.split_whitespace().collect();
+
+    for part in parts {
+        if part == "?" {
+            result.push(PatternElement::Wildcard);
+        } else {
+            // Try to parse as hex byte
+            match u8::from_str_radix(part, 16) {
+                Ok(byte) => result.push(PatternElement::Byte(byte)),
+                Err(_) => return Err("Invalid pattern format"),
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// Scan a buffer for pattern matches
+fn scan_pattern(buffer: &[u8], pattern: &[PatternElement], base_addr: umem) -> Vec<i64> {
+    let mut results = Vec::new();
+
+    'outer: for i in 0..buffer.len().saturating_sub(pattern.len()) {
+        for (j, element) in pattern.iter().enumerate() {
+            match element {
+                PatternElement::Byte(byte) => {
+                    if buffer[i + j] != *byte {
+                        continue 'outer;
+                    }
+                }
+                PatternElement::Wildcard => {
+                    // Wildcard matches any byte
+                }
+            }
+        }
+
+        // If we get here, the pattern matched
+        let addr = base_addr + i as umem;
+        results.push(addr as i64);
+    }
+
+    results
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -1291,6 +2005,8 @@ fn register_memflow_shards() {
     register_shard::<MemflowProcessModuleListShard>();
     register_shard::<MemflowWriteMemoryShard>();
     register_shard::<MemflowBatchWriteMemoryShard>();
+    register_shard::<MemflowMemoryScanShard>();
+    register_shard::<MemflowPatternScanShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }

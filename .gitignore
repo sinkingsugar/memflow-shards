@@ -2,3 +2,5 @@
 *.dylib
 *.log
 tests/externals/memflow.so
+*.bak
+*.sb
