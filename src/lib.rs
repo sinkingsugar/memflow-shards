@@ -15,6 +15,7 @@ use shards::types::{
     Var,
     ANYS_TYPES,
     ANY_TABLE_TYPES,
+    BYTES_TYPES,
     NONE_TYPES, // Input type
 };
 use shards::{fourCharacterCode, shlog_debug, shlog_error};
@@ -689,6 +690,254 @@ impl Shard for MemflowKernelModuleListShard {
     }
 }
 
+// Define the ReadMemory Shard
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.ReadMemory",
+    "Reads memory from a specific address in a process."
+)]
+struct MemflowReadMemoryShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters
+    #[shard_param("Address", "Memory address to read from.", [common_type::int, common_type::int_var])]
+    address: ParamVar,
+
+    #[shard_param("Size", "Number of bytes to read.", [common_type::int, common_type::int_var])]
+    size: ParamVar,
+
+    // Output buffer
+    output_buffer: ClonedVar,
+}
+
+impl Default for MemflowReadMemoryShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            address: ParamVar::new(0.into()),
+            size: ParamVar::new(1.into()),
+            output_buffer: ClonedVar::default(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowReadMemoryShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &BYTES_TYPES // Outputs an array of bytes
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        self.output_buffer = ClonedVar::default();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get address and size parameters
+        let address: i64 = self.address.get().as_ref().try_into()?;
+        let size: i64 = self.size.get().as_ref().try_into()?;
+
+        if size <= 0 {
+            return Err("Size must be greater than 0");
+        }
+
+        let size_usize = size as usize;
+        let address_umem = address as umem;
+
+        shlog_debug!(
+            "Reading memory at address: 0x{:x}, size: {} bytes",
+            address_umem,
+            size_usize
+        );
+
+        // Create buffer to hold the read data
+        let mut buffer = vec![0u8; size_usize];
+
+        // Read memory into buffer
+        process
+            .0
+            .read_raw_into(Address::from(address_umem), &mut buffer)
+            .map_err(|e| {
+                shlog_error!("Failed to read memory: {}", e);
+                "Failed to read memory from process."
+            })?;
+
+        self.output_buffer = buffer.as_slice().into();
+        Ok(Some(self.output_buffer.0))
+    }
+}
+
+// Define the BatchReadMemory Shard for more efficient reading
+#[derive(shards::shard)]
+#[shard_info(
+    "Memflow.BatchReadMemory",
+    "Reads memory from multiple addresses in a process using batched operations."
+)]
+struct MemflowBatchReadMemoryShard {
+    #[shard_required]
+    required: ExposedTypes,
+
+    // Parameters - table of addresses and sizes
+    #[shard_param("Reads", "Table of memory reads with 'address' and 'size' fields.", [common_type::any_table, common_type::any_table_var])]
+    reads: ParamVar,
+
+    // Output table of results
+    output_results: AutoTableVar,
+}
+
+impl Default for MemflowBatchReadMemoryShard {
+    fn default() -> Self {
+        Self {
+            required: ExposedTypes::new(),
+            reads: ParamVar::default(),
+            output_results: AutoTableVar::new(),
+        }
+    }
+}
+
+#[shards::shard_impl]
+impl Shard for MemflowBatchReadMemoryShard {
+    fn input_types(&mut self) -> &Types {
+        &MEMFLOW_PROCESS_TYPES // Takes process as input
+    }
+
+    fn output_types(&mut self) -> &Types {
+        &ANY_TABLE_TYPES // Outputs a table of results
+    }
+
+    fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
+        self.compose_helper(data)?;
+        Ok(self.output_types()[0])
+    }
+
+    fn warmup(&mut self, ctx: &Context) -> std::result::Result<(), &str> {
+        self.warmup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn cleanup(&mut self, ctx: Option<&Context>) -> std::result::Result<(), &str> {
+        if self.reads.is_none() {
+            return Err("Missing 'reads' parameter");
+        }
+        self.output_results = AutoTableVar::new();
+        self.cleanup_helper(ctx)?;
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        _context: &Context,
+        input: &Var,
+    ) -> std::result::Result<Option<Var>, &str> {
+        // Get the Process instance from input
+        let process = unsafe {
+            &mut *Var::from_ref_counted_object::<memflow_process_wrapper::MemflowProcessWrapper>(
+                input,
+                &*MEMFLOW_PROCESS_TYPE,
+            )?
+        };
+
+        // Get reads table
+        let reads_var = self.reads.get();
+        let reads_table = reads_var.as_table()?;
+
+        shlog_debug!("Performing batch memory read operation");
+
+        // Prepare data for batch operations
+        struct ReadOp {
+            key: Var,
+            address: umem,
+            buffer: Vec<u8>,
+        }
+
+        let mut read_ops = Vec::new();
+
+        // Collect all read operations first
+        for (key, _) in reads_table.iter() {
+            let read_entry = reads_table.get(key).unwrap();
+            let read_table = read_entry.as_table()?;
+
+            // Get address and size from the table
+            let address_var = read_table
+                .get(Var::ephemeral_string("address"))
+                .ok_or("Missing 'address' field in read entry")?;
+            let size_var = read_table
+                .get(Var::ephemeral_string("size"))
+                .ok_or("Missing 'size' field in read entry")?;
+
+            let address: i64 = address_var.as_ref().try_into()?;
+            let size: i64 = size_var.as_ref().try_into()?;
+
+            if size <= 0 {
+                return Err("Size must be greater than 0");
+            }
+
+            let size_usize = size as usize;
+            let address_umem = address as umem;
+
+            // Create read operation
+            read_ops.push(ReadOp {
+                key,
+                address: address_umem,
+                buffer: vec![0u8; size_usize],
+            });
+        }
+
+        // Now perform the batch read
+        {
+            let mut batcher = process.0.batcher();
+
+            // Set up all read operations in the batcher
+            for op in &mut read_ops {
+                batcher.read_raw_into(Address::from(op.address), &mut op.buffer);
+            }
+
+            // Execute all read operations in batch
+            batcher.commit_rw().map_err(|e| {
+                shlog_error!("Failed to execute batch memory read: {}", e);
+                "Failed to read memory from process."
+            })?;
+        }
+
+        // Process results
+        for op in read_ops {
+            let bytes = Var::ephemeral_slice(op.buffer.as_slice());
+            // Add to results table
+            self.output_results.0.insert_fast(op.key, &bytes);
+        }
+
+        Ok(Some(self.output_results.0 .0))
+    }
+}
+
 // 6. Registration
 #[ctor]
 fn register_memflow_shards() {
@@ -702,6 +951,8 @@ fn register_memflow_shards() {
     register_shard::<MemflowMemMapShard>();
     register_shard::<MemflowKernelModuleListShard>();
     register_shard::<MemflowModuleInfoShard>();
+    register_shard::<MemflowReadMemoryShard>();
+    register_shard::<MemflowBatchReadMemoryShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }
