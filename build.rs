@@ -8,6 +8,7 @@ fn main() {
             println!("cargo:rustc-cdylib-link-arg=tests/externals/memflow.dylib");
         }
         "windows" => {
+            println!("cargo:rustc-cdylib-link-arg=/FORCE:UNRESOLVED"); // avoid errors about unresolved symbols
             println!("cargo:rustc-cdylib-link-arg=/OUT:tests/externals/memflow.dll");
         }
         _ => {

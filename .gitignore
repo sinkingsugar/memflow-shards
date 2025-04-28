@@ -4,3 +4,7 @@
 tests/externals/memflow.so
 *.bak
 *.sb
+tests/externals/memflow.dll
+tests/externals/memflow.pdb
+tests/memflow_native.dll
+tests/memflow_native.pdb
