@@ -17,6 +17,7 @@ use shards::types::{
     Var,
     ANYS_TYPES,
     ANY_TABLE_TYPES,
+    ANY_TYPES,
     BYTES_TYPES,
     NONE_TYPES, // Input type
 };
@@ -295,6 +296,8 @@ impl Shard for MemflowProcessListShard {
             shlog_error!("Failed to get process list: {}", e);
             "Failed to get process list."
         })?;
+
+        self.process_list.0.clear();
 
         for process in process_list {
             let mut process_table = AutoTableVar::new();
@@ -605,6 +608,8 @@ impl Shard for MemflowMemMapShard {
         // Get memory maps
         let maps = process.0.mapped_mem_vec(gap_size);
 
+        self.mem_maps.0.clear();
+
         // Build output table with memory maps
         for map in maps {
             let address: Var = map.0.to_umem().into();
@@ -670,6 +675,8 @@ impl Shard for MemflowKernelModuleListShard {
             shlog_error!("Failed to get kernel module list: {}", e);
             "Failed to get kernel module list."
         })?;
+
+        self.module_list.0.clear();
 
         for module in module_list {
             // Create column values for module information
@@ -931,6 +938,8 @@ impl Shard for MemflowBatchReadMemoryShard {
             })?;
         }
 
+        self.output_results.0.clear();
+
         // Process results
         for op in read_ops {
             let bytes = Var::ephemeral_slice(op.buffer.as_slice());
@@ -1010,6 +1019,8 @@ impl Shard for MemflowProcessModuleListShard {
             shlog_error!("Failed to get process module list: {}", e);
             "Failed to get process module list."
         })?;
+
+        self.module_list.0.clear();
 
         for module in module_list {
             // Create column values for module information
@@ -1153,9 +1164,6 @@ struct MemflowBatchWriteMemoryShard {
 
     #[shard_param("Process", "The Memflow Process instance to write to.", [*MEMFLOW_PROCESS_TYPE, *MEMFLOW_PROCESS_TYPE_VAR])]
     process_instance: ParamVar,
-
-    // Output status
-    output_status: ClonedVar,
 }
 
 impl Default for MemflowBatchWriteMemoryShard {
@@ -1164,7 +1172,6 @@ impl Default for MemflowBatchWriteMemoryShard {
             required: ExposedTypes::new(),
             writes: ParamVar::default(),
             process_instance: ParamVar::default(),
-            output_status: ClonedVar::default(),
         }
     }
 }
@@ -1172,11 +1179,11 @@ impl Default for MemflowBatchWriteMemoryShard {
 #[shards::shard_impl]
 impl Shard for MemflowBatchWriteMemoryShard {
     fn input_types(&mut self) -> &Types {
-        &NONE_TYPES // Takes no input, all data comes from parameters
+        &ANY_TYPES
     }
 
     fn output_types(&mut self) -> &Types {
-        &NONE_TYPES // No output, just success/failure
+        &ANY_TYPES
     }
 
     fn compose(&mut self, data: &InstanceData) -> std::result::Result<Type, &str> {
@@ -1193,7 +1200,6 @@ impl Shard for MemflowBatchWriteMemoryShard {
         if self.writes.is_none() {
             return Err("Missing 'writes' parameter");
         }
-        self.output_status = ClonedVar::default();
         self.cleanup_helper(ctx)?;
         Ok(())
     }
@@ -1271,8 +1277,6 @@ impl Shard for MemflowBatchWriteMemoryShard {
             })?;
         }
 
-        // Return success
-        self.output_status = Var::new_bool(true).into();
         Ok(None)
     }
 }
@@ -1475,7 +1479,8 @@ impl Shard for MemflowMemoryScanShard {
         };
 
         // Perform the scan
-        let mut results = Vec::new();
+        self.scan_results.0.clear();
+
         let alignment_usize = alignment as usize;
 
         for map in filtered_maps {
@@ -1503,31 +1508,31 @@ impl Shard for MemflowMemoryScanShard {
                         previous_results,
                         compare_type.as_ref(),
                     );
-                    results.extend(matches);
+
+                    for result in matches {
+                        let address: Var = result.address.into();
+                        let value = match &search_value {
+                            ScanValue::Integer(_) => Var::new_int(result.value_int),
+                            ScanValue::Float(_) => Var::new_float(result.value_float.into()),
+                            ScanValue::Double(_) => Var::new_float(result.value_double),
+                            ScanValue::String(_) => Var::ephemeral_string(&result.value_string),
+                            ScanValue::Bytes(_) => {
+                                Var::ephemeral_slice(result.value_bytes.as_slice())
+                            }
+                        };
+
+                        let mut result_entry = AutoTableVar::new();
+                        result_entry.0.insert_fast_static("address", &address);
+                        result_entry.0.insert_fast_static("value", &value);
+
+                        self.scan_results.0.emplace_table(result_entry);
+                    }
                 }
                 Err(e) => {
                     shlog_debug!("Failed to read memory region at 0x{:x}: {}", base_addr, e);
                     continue;
                 }
             }
-        }
-
-        // Build results table
-        for result in results {
-            let address: Var = result.address.into();
-            let value = match &search_value {
-                ScanValue::Integer(_) => Var::new_int(result.value_int),
-                ScanValue::Float(_) => Var::new_float(result.value_float.into()),
-                ScanValue::Double(_) => Var::new_float(result.value_double),
-                ScanValue::String(_) => Var::ephemeral_string(&result.value_string),
-                ScanValue::Bytes(_) => Var::ephemeral_slice(result.value_bytes.as_slice()),
-            };
-
-            let mut result_entry = AutoTableVar::new();
-            result_entry.0.insert_fast_static("address", &address);
-            result_entry.0.insert_fast_static("value", &value);
-
-            self.scan_results.0.emplace_table(result_entry);
         }
 
         Ok(Some(self.scan_results.0 .0))
@@ -1894,8 +1899,7 @@ impl Shard for MemflowPatternScanShard {
 
         shlog_debug!("Filtered to {} memory regions", filtered_maps.len());
 
-        // Perform the scan
-        let mut results = Vec::new();
+        self.scan_results.0.clear();
 
         for map in filtered_maps {
             let base_addr = map.0.to_umem();
@@ -1915,19 +1919,16 @@ impl Shard for MemflowPatternScanShard {
                 Ok(_) => {
                     // Scan the buffer for pattern matches
                     let matches = scan_pattern(&buffer, &pattern, base_addr);
-                    results.extend(matches);
+                    for match_ in matches {
+                        let addr_var: Var = match_.into();
+                        self.scan_results.0.push(&addr_var);
+                    }
                 }
                 Err(e) => {
                     shlog_debug!("Failed to read memory region at 0x{:x}: {}", base_addr, e);
                     continue;
                 }
             }
-        }
-
-        // Build results table
-        for address in results {
-            let addr_var: Var = address.into();
-            self.scan_results.0.push(&addr_var);
         }
 
         Ok(Some(self.scan_results.0 .0))
