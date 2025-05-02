@@ -29,6 +29,8 @@ use lazy_static::lazy_static;
 use memflow::prelude::v1::*;
 
 mod protection_filter;
+mod xref_scanner;
+mod xref_shard;
 
 // 1. Define static types for the Memflow Inventory object
 lazy_static! {
@@ -66,7 +68,7 @@ mod memflow_os_wrapper {
     ref_counted_object_type_impl!(MemflowOsWrapper);
 }
 
-mod memflow_process_wrapper {
+pub mod memflow_process_wrapper {
     use super::*;
 
     // Process wrapper struct to hold the ProcessInstance
@@ -2007,6 +2009,7 @@ fn register_memflow_shards() {
     register_shard::<MemflowBatchWriteMemoryShard>();
     register_shard::<MemflowMemoryScanShard>();
     register_shard::<MemflowPatternScanShard>();
+    register_shard::<xref_shard::MemflowFunctionXrefShard>();
 
     shlog_debug!("Memflow Shards registered.");
 }

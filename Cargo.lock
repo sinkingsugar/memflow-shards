@@ -222,6 +222,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1628fb46dfa0b37568d12e5edd512553eccf6a22a78e8bde00bb4aed84d5bdbf"
 
 [[package]]
+name = "capstone"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1097e608594dad3bad608295567f757742b883606fe150faf7a9740b849730d8"
+dependencies = [
+ "capstone-sys",
+ "libc",
+]
+
+[[package]]
+name = "capstone-sys"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e7f651d5ec4c2a2e6c508f2c8032655003cd728ec85663e9796616990e25b5a"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,6 +1052,7 @@ dependencies = [
 name = "memflow-shards"
 version = "0.1.0"
 dependencies = [
+ "capstone",
  "ctor",
  "env_logger",
  "lazy_static",
