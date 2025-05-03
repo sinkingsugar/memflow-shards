@@ -1,12 +1,15 @@
 use crate::memflow_process_wrapper::MemflowProcessWrapper;
+use crate::protection_filter::protection_filter_matches;
 use crate::xref_scanner::{scan_region_for_xrefs, Arch};
 use crate::MEMFLOW_PROCESS_TYPE;
-use crate::protection_filter::protection_filter_matches;
 
 use memflow::prelude::v1::*;
 use shards::shard::Shard;
-use shards::types::{common_type, AutoSeqVar, AutoTableVar, Context, ExposedTypes, InstanceData, ParamVar, Type, Types, Var, ANYS_TYPES};
 use shards::shlog_debug;
+use shards::types::{
+    common_type, AutoSeqVar, AutoTableVar, Context, ExposedTypes, InstanceData, ParamVar, Type,
+    Types, Var, ANYS_TYPES,
+};
 
 // Define the FunctionXref Shard
 #[derive(shards::shard)]
@@ -133,7 +136,11 @@ impl Shard for MemflowFunctionXrefShard {
                 continue;
             }
 
-            shlog_debug!("Scanning region at 0x{:x} with size {}", base_addr.to_umem(), size);
+            shlog_debug!(
+                "Scanning region at 0x{:x} with size {}",
+                base_addr.to_umem(),
+                size
+            );
 
             // Scan the region for references
             let xrefs = scan_region_for_xrefs(
@@ -150,29 +157,33 @@ impl Shard for MemflowFunctionXrefShard {
             // Add results to output
             for xref in xrefs {
                 let mut result_entry = AutoTableVar::new();
-                
+
                 // Add basic information
                 let address_var: Var = (xref.address as i64).into();
                 let type_var = Var::ephemeral_string(xref.xref_type.to_string());
                 let instruction_var = Var::ephemeral_string(&xref.instruction);
-                
+
                 result_entry.0.insert_fast_static("address", &address_var);
                 result_entry.0.insert_fast_static("type", &type_var);
-                result_entry.0.insert_fast_static("instruction", &instruction_var);
-                
+                result_entry
+                    .0
+                    .insert_fast_static("instruction", &instruction_var);
+
                 // Add context instructions
                 let mut context_seq = AutoSeqVar::new();
                 for (_i, ctx_insn) in xref.context.iter().enumerate() {
                     let ctx_var = Var::ephemeral_string(ctx_insn);
                     context_seq.0.push(&ctx_var);
                 }
-                
-                result_entry.0.insert_fast_static("context", &context_seq.0.0);
-                
+
+                result_entry
+                    .0
+                    .insert_fast_static("context", &context_seq.0 .0);
+
                 self.xref_results.0.emplace_table(result_entry);
             }
         }
 
-        Ok(Some(self.xref_results.0.0))
+        Ok(Some(self.xref_results.0 .0))
     }
 }
