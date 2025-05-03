@@ -1792,7 +1792,7 @@ struct MemflowPatternScanShard {
     required: ExposedTypes,
 
     // Parameters
-    #[shard_param("Pattern", "Byte pattern to scan for (e.g., '48 8B ? ? 89 7C').", [common_type::string, common_type::string_var])]
+    #[shard_param("Pattern", "Byte pattern to scan for (e.g., '48 8B ? ? 89 7C' or '48 8B [01001...] 89 7C'). Content in square brackets is treated as wildcards.", [common_type::string, common_type::string_var])]
     pattern: ParamVar,
 
     #[shard_param("MinSize", "Minimum size of memory regions to scan (default: 4096).", [common_type::none, common_type::int, common_type::int_var])]
@@ -1946,21 +1946,70 @@ enum PatternElement {
 // Parse a pattern string into a vector of pattern elements
 fn parse_pattern(pattern: &str) -> std::result::Result<Vec<PatternElement>, &'static str> {
     let mut result = Vec::new();
-    let parts: Vec<&str> = pattern.split_whitespace().collect();
+    let mut chars = pattern.chars().peekable();
 
-    for part in parts {
-        if part == "?" {
-            result.push(PatternElement::Wildcard);
-        } else {
-            // Try to parse as hex byte
-            match u8::from_str_radix(part, 16) {
-                Ok(byte) => result.push(PatternElement::Byte(byte)),
-                Err(_) => return Err("Invalid pattern format"),
+    // Buffer to accumulate characters between whitespace
+    let mut current_token = String::new();
+    
+    while let Some(c) = chars.next() {
+        match c {
+            // Handle whitespace - process any accumulated token
+            ' ' | '\t' | '\n' | '\r' => {
+                if !current_token.is_empty() {
+                    process_token(&current_token, &mut result)?;
+                    current_token.clear();
+                }
+            },
+            // Handle opening bracket - start of a bracketed pattern
+            '[' => {
+                if !current_token.is_empty() {
+                    process_token(&current_token, &mut result)?;
+                    current_token.clear();
+                }
+                
+                // Skip everything until the closing bracket
+                while let Some(c) = chars.next() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+                
+                // Add a wildcard for the bracketed content
+                result.push(PatternElement::Wildcard);
+            },
+            // Normal character - add to current token
+            _ => {
+                current_token.push(c);
             }
         }
     }
+    
+    // Process any remaining token
+    if !current_token.is_empty() {
+        process_token(&current_token, &mut result)?;
+    }
 
     Ok(result)
+}
+
+// Helper function to process a token and add the appropriate pattern element
+fn process_token(token: &str, result: &mut Vec<PatternElement>) -> std::result::Result<(), &'static str> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(());
+    }
+    
+    if token == "?" {
+        result.push(PatternElement::Wildcard);
+    } else {
+        // Try to parse as hex byte
+        match u8::from_str_radix(token, 16) {
+            Ok(byte) => result.push(PatternElement::Byte(byte)),
+            Err(_) => return Err("Invalid pattern format"),
+        }
+    }
+    
+    Ok(())
 }
 
 // Scan a buffer for pattern matches
